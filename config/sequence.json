@@ -1,0 +1,16 @@
+{
+    "version": 1,
+    "coordinate_type": "camera_image_pixels",
+    "robot_movement_enabled": true,
+    "sequence": [
+        {
+            "fruit": "banana",
+            "destination_name": "banana zone",
+            "destination_pixel": {
+                "x": 604,
+                "y": 270
+            },
+            "status": "Destination pixel recorded"
+        }
+    ]
+}

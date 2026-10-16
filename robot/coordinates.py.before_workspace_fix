@@ -1,0 +1,114 @@
+"""Coordinate conversion using the existing Hiwonder company calibration.
+
+This deliberately mirrors ObjectSortingNode.get_object_world_position() and
+transport_thread() without constructing ObjectSortingNode (whose constructor
+starts the company's sorting threads and servo publisher).
+"""
+from pathlib import Path
+
+import cv2
+import numpy as np
+import yaml
+
+from sdk import common
+
+
+DEFAULT_COMPANY_CONFIG = Path.home() / "ros2_ws/src/app/config"
+
+
+class CompanyCoordinateMapper:
+    def __init__(self, config_dir=DEFAULT_COMPANY_CONFIG):
+        self.config_dir = Path(config_dir).expanduser()
+        self.transform_path = self.config_dir / "transform.yaml"
+        self.calibration_path = self.config_dir / "calibration.yaml"
+        if not self.transform_path.is_file():
+            raise FileNotFoundError(f"Company transform not found: {self.transform_path}")
+        if not self.calibration_path.is_file():
+            raise FileNotFoundError(f"Company calibration not found: {self.calibration_path}")
+        with self.transform_path.open("r", encoding="utf-8") as f:
+            self.transform = yaml.safe_load(f)
+        with self.calibration_path.open("r", encoding="utf-8") as f:
+            self.calibration = yaml.safe_load(f)
+
+    def ensure_pixel_in_calibrated_roi(self, pixel, camera_matrix, distortion, image_size=(640, 480)):
+        """Reject points outside the calibrated work-area polygon from company code."""
+        width, height = int(image_size[0]), int(image_size[1])
+        x, y = int(pixel[0]), int(pixel[1])
+        if not (0 <= x < width and 0 <= y < height):
+            raise ValueError(f"Pixel {(x, y)} is outside the RGB image bounds {width}x{height}")
+        extrinsic = np.asarray(self.transform["extristric"], dtype=float)
+        tvec = extrinsic[:1]
+        rmat = extrinsic[1:]
+        tvec, rmat = common.extristric_plane_shift(
+            np.asarray(tvec).reshape((3, 1)), np.asarray(rmat), 0.03
+        )
+        corners = np.asarray(self.transform["corners"], dtype=np.float32).reshape(-1, 3)
+        K = np.asarray(camera_matrix, dtype=float).reshape(3, 3)
+        D = np.asarray(distortion, dtype=float).reshape(-1)
+        projected, _ = cv2.projectPoints(corners[:-1], np.asarray(rmat), np.asarray(tvec), K, D)
+        polygon = np.int32(projected).reshape(-1, 2)
+        inside = cv2.pointPolygonTest(polygon, (float(x), float(y)), False)
+        if inside < 0:
+            raise ValueError(
+                f"Pixel {(x, y)} is outside the calibrated company workspace polygon. "
+                "Move the fruit/destination inside the visible calibrated work area and select again."
+            )
+
+    def projection_matrix(self):
+        """Return the calibrated camera-to-work-plane projection matrix used by company code."""
+        extrinsic = np.asarray(self.transform["extristric"], dtype=float)
+        tvec = extrinsic[:1]
+        rmat = extrinsic[1:]
+        tvec, rmat = common.extristric_plane_shift(
+            np.asarray(tvec).reshape((3, 1)), np.asarray(rmat), 0.03
+        )
+        return np.row_stack((np.column_stack((rmat, tvec)), np.array([[0, 0, 0, 1]])))
+
+    def pixel_to_company_world(self, pixel, camera_matrix, height_m):
+        """Map an RGB pixel onto the company's calibrated work plane.
+
+        pixel is in the original 640x480 RGB image, not the resized UI widget.
+        camera_matrix is the 3x3 K matrix from /depth_cam/rgb/camera_info.
+        Returns XYZ in metres before the company's kinematics correction.
+        """
+        x, y = int(pixel[0]), int(pixel[1])
+        K = np.matrix(camera_matrix, dtype=float)
+        extrinsic = np.asarray(self.transform["extristric"], dtype=float)
+        tvec = extrinsic[:1]
+        rmat = extrinsic[1:]
+        tvec, rmat = common.extristric_plane_shift(
+            np.asarray(tvec).reshape((3, 1)), np.asarray(rmat), 0.03
+        )
+        projection = np.row_stack((np.column_stack((rmat, tvec)), np.array([[0, 0, 0, 1]])))
+        world_pose = np.asarray(common.pixels_to_world([(x, y)], K, projection)[0], dtype=float)
+        world_pose[0] = -world_pose[0]
+        world_pose[1] = -world_pose[1]
+        white_area = np.asarray(self.transform["white_area_pose_world"], dtype=float)
+        position = white_area[:3, 3] + world_pose
+        position[2] = float(height_m)
+
+        pixel_cal = self.calibration["pixel"]
+        for i in range(3):
+            position[i] = position[i] * float(pixel_cal["scale"][i]) + float(pixel_cal["offset"][i])
+        if not np.all(np.isfinite(position)):
+            raise ValueError(f"Non-finite robot coordinate calculated for pixel {(x, y)}")
+        return position.tolist()
+
+    def pick_kinematics_position(self, world_position):
+        """Apply the same kinematics offset/scale used by company sorting."""
+        pos = list(map(float, world_position))
+        cal = self.calibration["kinematics"]
+        return [pos[i] * float(cal["scale"][i]) + float(cal["offset"][i]) for i in range(3)]
+
+    def place_kinematics_position(self, world_position):
+        """Mirror the company's angle-dependent placement correction exactly."""
+        pos = list(map(float, world_position))
+        cal = self.calibration["kinematics"]
+        offset = list(map(float, cal["offset"]))
+        scale = list(map(float, cal["scale"]))
+        angle = float(np.degrees(np.arctan2(pos[1], pos[0])))
+        if angle > 45:
+            return [pos[0] * scale[1] - offset[1], pos[1] * scale[0] + offset[0], pos[2] * scale[2] + offset[2]]
+        if angle < -45:
+            return [pos[0] * scale[1] + offset[1], pos[1] * scale[0] - offset[0], pos[2] * scale[2] + offset[2]]
+        return [pos[0] * scale[0] + offset[0], pos[1] * scale[1] + offset[1], pos[2] * scale[2] + offset[2]]

@@ -1,0 +1,875 @@
+#!/usr/bin/env python3
+
+import json
+import logging
+import sys
+import threading
+import time
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+import cv2
+import rclpy
+
+from cv_bridge import CvBridge
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor
+from PyQt5.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+
+from vision.detector import FruitDetector
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+PROJECT_DIR = Path(__file__).resolve().parent
+LOG_DIR = PROJECT_DIR / "logs"
+LOG_FILE = LOG_DIR / "jetarm_app.log"
+SEQUENCE_FILE = PROJECT_DIR / "config" / "sequence.json"
+
+MODEL_PATH = "/home/ubuntu/Downloads/yolo_1791978301.pt"
+CAMERA_TOPIC = "/depth_cam/rgb/image_raw"
+
+CONFIDENCE_THRESHOLD = 0.50
+IMAGE_SIZE = 640
+
+FRUITS = ["banana", "apple", "orange"]
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+def configure_logging():
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger("jetarm_app")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+    logger.propagate = False
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | "
+        "%(threadName)s | %(message)s"
+    )
+
+    file_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    logger.info("=" * 60)
+    logger.info("JetArm Fruit Pick-and-Place application starting")
+    logger.info("Model: %s", MODEL_PATH)
+    logger.info("Camera topic: %s", CAMERA_TOPIC)
+    logger.info("Log file: %s", LOG_FILE)
+    logger.info("Robot movement is disabled")
+
+    return logger
+
+
+LOGGER = configure_logging()
+
+
+# ============================================================
+# CAMERA NODE
+# ============================================================
+
+class FruitCameraNode(Node):
+
+    def __init__(self):
+        super().__init__("jetarm_fruit_camera")
+
+        self.bridge = CvBridge()
+        self.lock = threading.Lock()
+        self.latest_frame = None
+        self.frame_count = 0
+
+        self.subscription = self.create_subscription(
+            Image,
+            CAMERA_TOPIC,
+            self.image_callback,
+            10,
+        )
+
+        LOGGER.info("Subscribed to camera topic: %s", CAMERA_TOPIC)
+
+    def image_callback(self, msg):
+        try:
+            frame = self.bridge.imgmsg_to_cv2(
+                msg,
+                desired_encoding="bgr8",
+            )
+
+            with self.lock:
+                self.latest_frame = frame
+                self.frame_count += 1
+
+        except Exception:
+            LOGGER.exception("Camera image conversion failed")
+
+    def get_latest_frame(self):
+        with self.lock:
+            if self.latest_frame is None:
+                return None, self.frame_count
+
+            return self.latest_frame.copy(), self.frame_count
+
+
+# ============================================================
+# CAMERA WORKER
+# ============================================================
+
+class CameraWorker(QThread):
+
+    image_ready = pyqtSignal(QImage)
+    detections_ready = pyqtSignal(list)
+    status_ready = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.running = True
+        self.node = None
+
+    def stop(self):
+        LOGGER.info("Camera worker stop requested")
+        self.running = False
+        self.wait()
+        LOGGER.info("Camera worker stopped")
+
+    def run(self):
+        initialized_ros = False
+        last_frame_id = -1
+
+        try:
+            LOGGER.info("Loading trained YOLO model")
+
+            detector = FruitDetector(
+                model_path=MODEL_PATH,
+                confidence=CONFIDENCE_THRESHOLD,
+                image_size=IMAGE_SIZE,
+            )
+
+            if not rclpy.ok():
+                rclpy.init(args=None)
+                initialized_ros = True
+
+            self.node = FruitCameraNode()
+            self.status_ready.emit("Waiting for camera frames...")
+
+            while self.running and rclpy.ok():
+                rclpy.spin_once(self.node, timeout_sec=0.01)
+
+                frame, frame_id = self.node.get_latest_frame()
+
+                if frame is None or frame_id == last_frame_id:
+                    time.sleep(0.005)
+                    continue
+
+                last_frame_id = frame_id
+
+                # Run inference on alternating frames.
+                if frame_id % 2:
+                    continue
+
+                try:
+                    detections = detector.detect(frame)
+                except Exception:
+                    LOGGER.exception("YOLO inference failed")
+                    self.status_ready.emit("ERROR: YOLO inference failed")
+                    continue
+
+                for item in detections:
+                    x1, y1, x2, y2 = item["bbox"]
+
+                    cv2.rectangle(
+                        frame,
+                        (x1, y1),
+                        (x2, y2),
+                        (0, 255, 0),
+                        2,
+                    )
+
+                    cv2.putText(
+                        frame,
+                        f"{item['class_name']}: {item['confidence']:.2f}",
+                        (x1, max(y1 - 10, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                height, width, channels = rgb.shape
+
+                qimage = QImage(
+                    rgb.data,
+                    width,
+                    height,
+                    channels * width,
+                    QImage.Format_RGB888,
+                ).copy()
+
+                self.image_ready.emit(qimage)
+                self.detections_ready.emit(detections)
+
+                self.status_ready.emit(
+                    f"Camera active | {len(detections)} fruit detection(s)"
+                )
+
+        except Exception:
+            LOGGER.exception("Camera worker failed")
+            self.status_ready.emit("Camera error; inspect application logs")
+
+        finally:
+            if self.node is not None:
+                self.node.destroy_node()
+                self.node = None
+
+            if initialized_ros and rclpy.ok():
+                rclpy.shutdown()
+
+
+# ============================================================
+# MAIN UI
+# ============================================================
+
+class JetArmFruitApp(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("JetArm AI Fruit Pick-and-Place")
+        self.resize(1200, 900)
+
+        self.sequence = []
+        self.destination_mode = False
+        self.display_image_size = (0, 0)
+
+        self.camera_label = QLabel("Waiting for camera...")
+        self.camera_label.setAlignment(Qt.AlignCenter)
+        self.camera_label.setMinimumSize(640, 400)
+        self.camera_label.setStyleSheet(
+            "background-color: #202020; color: white;"
+            "border: 1px solid #555;"
+        )
+        self.camera_label.setMouseTracking(True)
+        self.camera_label.mousePressEvent = self.camera_clicked
+        self.camera_label.mouseMoveEvent = self.camera_moved
+
+        self.status_label = QLabel("Initializing...")
+        self.status_label.setWordWrap(True)
+
+        self.fruit_combo = QComboBox()
+        self.fruit_combo.addItems(FRUITS)
+
+        self.destination_name = QLineEdit()
+        self.destination_name.setPlaceholderText(
+            "Destination name, e.g. Banana Zone"
+        )
+
+        self.add_button = QPushButton("Add Fruit to Sequence")
+        self.set_point_button = QPushButton("Set Destination Point")
+        self.cancel_button = QPushButton("Cancel Point Selection")
+        self.remove_button = QPushButton("Remove Selected")
+        self.clear_button = QPushButton("Clear Sequence")
+        self.save_button = QPushButton("Save Sequence")
+        self.load_button = QPushButton("Load Sequence")
+        self.stop_button = QPushButton("Stop Camera")
+        self.sequence_list = QListWidget()
+
+        self.detection_label = QLabel("No detections yet.")
+        self.detection_label.setWordWrap(True)
+
+        self.point_label = QLabel(
+            "Destination: not selected. "
+            "Select a sequence item, then click Set Destination Point."
+        )
+        self.point_label.setWordWrap(True)
+
+        self.safety_label = QLabel(
+            "Robot movement disabled. Clicked image points are pixels, "
+            "not yet calibrated robot coordinates."
+        )
+        self.safety_label.setWordWrap(True)
+        self.safety_label.setStyleSheet(
+            "color: #9c3500; font-weight: bold;"
+        )
+
+        self.start_button = QPushButton("Start Pick-and-Place")
+        self.start_button.setEnabled(False)
+
+        # Fruit configuration
+        fruit_layout = QHBoxLayout()
+        fruit_layout.addWidget(QLabel("Fruit:"))
+        fruit_layout.addWidget(self.fruit_combo)
+        fruit_layout.addWidget(QLabel("Destination name:"))
+        fruit_layout.addWidget(self.destination_name)
+        fruit_layout.addWidget(self.add_button)
+
+        # Destination controls
+        destination_layout = QHBoxLayout()
+        destination_layout.addWidget(self.set_point_button)
+        destination_layout.addWidget(self.cancel_button)
+
+        # Queue controls
+        queue_layout = QHBoxLayout()
+        queue_layout.addWidget(self.remove_button)
+        queue_layout.addWidget(self.clear_button)
+        queue_layout.addWidget(self.save_button)
+        queue_layout.addWidget(self.load_button)
+        queue_layout.addStretch()
+        queue_layout.addWidget(self.stop_button)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.camera_label, stretch=4)
+        layout.addWidget(self.status_label)
+        layout.addWidget(QLabel("Detected fruits:"))
+        layout.addWidget(self.detection_label)
+        layout.addLayout(fruit_layout)
+        layout.addWidget(QLabel("Processing sequence:"))
+        layout.addWidget(self.sequence_list, stretch=1)
+        layout.addLayout(destination_layout)
+        layout.addWidget(self.point_label)
+        layout.addLayout(queue_layout)
+        layout.addWidget(self.safety_label)
+        layout.addWidget(self.start_button)
+
+        central = QWidget()
+        central.setLayout(layout)
+        self.setCentralWidget(central)
+
+        self.add_button.clicked.connect(self.add_to_sequence)
+        self.set_point_button.clicked.connect(self.activate_point_selection)
+        self.cancel_button.clicked.connect(self.cancel_point_selection)
+        self.remove_button.clicked.connect(self.remove_selected)
+        self.clear_button.clicked.connect(self.clear_sequence)
+        self.save_button.clicked.connect(self.save_sequence)
+        self.load_button.clicked.connect(self.load_sequence)
+        self.stop_button.clicked.connect(self.stop_camera)
+
+        self.worker = CameraWorker()
+        self.worker.image_ready.connect(self.update_camera)
+        self.worker.detections_ready.connect(self.update_detections)
+        self.worker.status_ready.connect(self.update_status)
+        self.worker.start()
+
+        LOGGER.info("Main UI initialized")
+
+    # --------------------------------------------------------
+    # IMAGE AND DESTINATION MARKERS
+    # --------------------------------------------------------
+
+    def update_camera(self, image):
+        self.display_image_size = (image.width(), image.height())
+
+        # Draw markers onto a copy of the current image.
+        pixmap = QPixmap.fromImage(image)
+        painter = QPainter(pixmap)
+
+        for item in self.sequence:
+            point = item.get("destination_pixel")
+            if point is None:
+                continue
+
+            x, y = point["x"], point["y"]
+
+            painter.setPen(QPen(QColor(255, 60, 60), 3))
+            painter.drawLine(x - 10, y, x + 10, y)
+            painter.drawLine(x, y - 10, x, y + 10)
+            painter.setBrush(QColor(255, 60, 60, 100))
+            painter.drawEllipse(x - 6, y - 6, 12, 12)
+
+            painter.setPen(QPen(QColor(255, 255, 0), 2))
+            painter.drawText(x + 12, y - 10, item["destination_name"])
+
+        painter.end()
+
+        scaled = pixmap.scaled(
+            self.camera_label.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+
+        self.camera_label.setPixmap(scaled)
+
+    def camera_clicked(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+
+        if not self.destination_mode:
+            LOGGER.info("Image clicked while point selection inactive")
+            return
+
+        row = self.sequence_list.currentRow()
+
+        if row < 0 or row >= len(self.sequence):
+            LOGGER.warning("Destination click ignored: no queue item selected")
+            return
+
+        pixmap = self.camera_label.pixmap()
+
+        if pixmap is None:
+            LOGGER.warning("Destination click ignored: camera image missing")
+            return
+
+        # Map the click from the displayed image to the original image.
+        label_width = self.camera_label.width()
+        label_height = self.camera_label.height()
+
+        image_width, image_height = self.display_image_size
+        if image_width <= 0 or image_height <= 0:
+            return
+
+        scale = min(
+            label_width / image_width,
+            label_height / image_height,
+        )
+
+        shown_width = image_width * scale
+        shown_height = image_height * scale
+
+        x_offset = (label_width - shown_width) / 2
+        y_offset = (label_height - shown_height) / 2
+
+        shown_x = event.pos().x() - x_offset
+        shown_y = event.pos().y() - y_offset
+
+        if not (
+            0 <= shown_x < shown_width
+            and 0 <= shown_y < shown_height
+        ):
+            LOGGER.warning("Destination click outside camera image")
+            return
+
+        image_x = int(shown_x / scale)
+        image_y = int(shown_y / scale)
+
+        item = self.sequence[row]
+        item["destination_pixel"] = {
+            "x": image_x,
+            "y": image_y,
+        }
+        item["status"] = "Destination pixel recorded"
+
+        self.destination_mode = False
+        self.camera_label.setCursor(Qt.ArrowCursor)
+
+        self.refresh_sequence()
+        self.sequence_list.setCurrentRow(row)
+
+        message = (
+            f"{item['destination_name']} saved at image pixel "
+            f"({image_x}, {image_y}). Robot coordinates not calculated."
+        )
+
+        self.point_label.setText(message)
+        self.status_label.setText("Destination marker saved.")
+
+        LOGGER.info(
+            "DESTINATION_SAVED sequence=%d fruit=%s name=%s "
+            "pixel_x=%d pixel_y=%d",
+            row + 1,
+            item["fruit"],
+            item["destination_name"],
+            image_x,
+            image_y,
+        )
+
+    def camera_moved(self, event):
+        if self.destination_mode:
+            self.camera_label.setCursor(Qt.CrossCursor)
+
+    # --------------------------------------------------------
+    # SEQUENCE
+    # --------------------------------------------------------
+
+    def add_to_sequence(self):
+        fruit = self.fruit_combo.currentText().strip().lower()
+        name = self.destination_name.text().strip()
+
+        if not name:
+            QMessageBox.warning(
+                self,
+                "Destination Name Required",
+                "Enter a destination name, for example Banana Zone.",
+            )
+            return
+
+        item = {
+            "fruit": fruit,
+            "destination_name": name,
+            "destination_pixel": None,
+            "status": "Waiting for destination",
+        }
+
+        self.sequence.append(item)
+        self.refresh_sequence()
+
+        LOGGER.info("SEQUENCE_ADDED item=%s", item)
+
+    def activate_point_selection(self):
+        row = self.sequence_list.currentRow()
+
+        if row < 0 or row >= len(self.sequence):
+            QMessageBox.information(
+                self,
+                "Select Sequence Item",
+                "Select a fruit in the sequence first.",
+            )
+            return
+
+        self.destination_mode = True
+        self.camera_label.setCursor(Qt.CrossCursor)
+
+        item = self.sequence[row]
+
+        self.point_label.setText(
+            f"POINT SELECTION ACTIVE: Click the camera image to set "
+            f"the destination for {item['destination_name']}."
+        )
+
+        self.status_label.setText(
+            "Crosshair active: click a point inside the camera image."
+        )
+
+        LOGGER.info(
+            "DESTINATION_SELECTION_STARTED sequence=%d name=%s",
+            row + 1,
+            item["destination_name"],
+        )
+
+    def cancel_point_selection(self):
+        self.destination_mode = False
+        self.camera_label.setCursor(Qt.ArrowCursor)
+        self.point_label.setText("Destination selection cancelled.")
+
+        LOGGER.info("DESTINATION_SELECTION_CANCELLED")
+
+    def refresh_sequence(self):
+        row = self.sequence_list.currentRow()
+        self.sequence_list.clear()
+
+        for index, item in enumerate(self.sequence, start=1):
+            point = item["destination_pixel"]
+
+            point_text = (
+                "not selected"
+                if point is None
+                else f"pixel=({point['x']}, {point['y']})"
+            )
+
+            self.sequence_list.addItem(
+                f"{index}. {item['fruit'].capitalize()} -> "
+                f"{item['destination_name']} | {point_text} | "
+                f"[{item['status']}]"
+            )
+
+        if self.sequence:
+            self.sequence_list.setCurrentRow(
+                min(max(row, 0), len(self.sequence) - 1)
+            )
+
+        self.start_button.setEnabled(False)
+
+    def remove_selected(self):
+        row = self.sequence_list.currentRow()
+
+        if row < 0 or row >= len(self.sequence):
+            return
+
+        removed = self.sequence.pop(row)
+        self.refresh_sequence()
+
+        LOGGER.info("SEQUENCE_REMOVED item=%s", removed)
+
+    def clear_sequence(self):
+        self.sequence.clear()
+        self.destination_mode = False
+        self.camera_label.setCursor(Qt.ArrowCursor)
+        self.refresh_sequence()
+        self.point_label.setText("Destination: not selected.")
+
+        LOGGER.info("SEQUENCE_CLEARED")
+
+    def save_sequence(self):
+        if not self.sequence:
+            QMessageBox.information(
+                self,
+                "Nothing to Save",
+                "Add at least one fruit to the sequence first.",
+            )
+            return
+
+        incomplete = [
+            item["destination_name"]
+            for item in self.sequence
+            if item.get("destination_pixel") is None
+        ]
+
+        if incomplete:
+            QMessageBox.warning(
+                self,
+                "Destination Missing",
+                "Set a destination point for every sequence item "
+                "before saving.\n\nMissing destination(s):\n"
+                + "\n".join(incomplete),
+            )
+            return
+
+        data = {
+            "version": 1,
+            "coordinate_type": "camera_image_pixels",
+            "robot_movement_enabled": False,
+            "sequence": self.sequence,
+        }
+
+        try:
+            SEQUENCE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+            temporary_file = SEQUENCE_FILE.with_suffix(".json.tmp")
+
+            with temporary_file.open("w", encoding="utf-8") as file:
+                json.dump(data, file, indent=4, ensure_ascii=False)
+                file.write("\n")
+
+            temporary_file.replace(SEQUENCE_FILE)
+
+            LOGGER.info(
+                "SEQUENCE_SAVED file=%s count=%d",
+                SEQUENCE_FILE,
+                len(self.sequence),
+            )
+
+            QMessageBox.information(
+                self,
+                "Sequence Saved",
+                f"Saved {len(self.sequence)} sequence item(s).\n\n"
+                f"File:\n{SEQUENCE_FILE}\n\n"
+                "Destination coordinates are camera pixels, "
+                "not robot coordinates.",
+            )
+
+        except Exception as exc:
+            LOGGER.exception("Failed to save sequence")
+
+            QMessageBox.critical(
+                self,
+                "Save Failed",
+                f"Could not save the sequence:\n{exc}",
+            )
+
+    def load_sequence(self):
+        if not SEQUENCE_FILE.is_file():
+            QMessageBox.information(
+                self,
+                "No Saved Sequence",
+                f"No saved sequence was found at:\n{SEQUENCE_FILE}",
+            )
+            return
+
+        try:
+            with SEQUENCE_FILE.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+
+            if not isinstance(data, dict):
+                raise ValueError("The saved file must contain a JSON object.")
+
+            if data.get("version") != 1:
+                raise ValueError("Unsupported sequence file version.")
+
+            if data.get("coordinate_type") != "camera_image_pixels":
+                raise ValueError("Unexpected coordinate type in saved file.")
+
+            saved_sequence = data.get("sequence")
+
+            if not isinstance(saved_sequence, list):
+                raise ValueError("'sequence' must be a list.")
+
+            validated_sequence = []
+
+            for index, item in enumerate(saved_sequence, start=1):
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        f"Sequence item {index} is not a valid object."
+                    )
+
+                fruit = item.get("fruit")
+                name = item.get("destination_name")
+                point = item.get("destination_pixel")
+
+                if fruit not in FRUITS:
+                    raise ValueError(
+                        f"Sequence item {index} has an unsupported fruit."
+                    )
+
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError(
+                        f"Sequence item {index} has no destination name."
+                    )
+
+                if point is not None:
+                    if not isinstance(point, dict):
+                        raise ValueError(
+                            f"Sequence item {index} has an invalid point."
+                        )
+
+                    x = point.get("x")
+                    y = point.get("y")
+
+                    if (
+                        type(x) is not int
+                        or type(y) is not int
+                        or not (
+                            0 <= x < 640
+                            and 0 <= y < 480
+                        )
+                    ):
+                        raise ValueError(
+                            f"Sequence item {index} has invalid pixel "
+                            "coordinates. Expected x in 0-639 and y in 0-479."
+                        )
+
+                    point = {"x": x, "y": y}
+
+                validated_sequence.append(
+                    {
+                        "fruit": fruit,
+                        "destination_name": name.strip(),
+                        "destination_pixel": point,
+                        "status": (
+                            "Destination pixel recorded"
+                            if point is not None
+                            else "Waiting for destination"
+                        ),
+                    }
+                )
+
+            if self.sequence:
+                answer = QMessageBox.question(
+                    self,
+                    "Replace Current Sequence?",
+                    "Loading will replace the sequence currently in the UI. "
+                    "Save the current sequence first if you need it.\n\n"
+                    "Continue?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+
+                if answer != QMessageBox.Yes:
+                    return
+
+            self.destination_mode = False
+            self.camera_label.setCursor(Qt.ArrowCursor)
+            self.sequence = validated_sequence
+            self.refresh_sequence()
+
+            self.point_label.setText(
+                "Loaded sequence. Destination points are camera pixels."
+            )
+
+            LOGGER.info(
+                "SEQUENCE_LOADED file=%s count=%d",
+                SEQUENCE_FILE,
+                len(self.sequence),
+            )
+
+            QMessageBox.information(
+                self,
+                "Sequence Loaded",
+                f"Loaded {len(self.sequence)} sequence item(s).\n\n"
+                "The destination markers will appear on the live camera "
+                "image. Robot movement remains disabled.",
+            )
+
+        except Exception as exc:
+            LOGGER.exception("Failed to load sequence")
+
+            QMessageBox.critical(
+                self,
+                "Load Failed",
+                f"Could not load the saved sequence:\n{exc}",
+            )
+
+
+    # --------------------------------------------------------
+    # DETECTIONS AND SHUTDOWN
+    # --------------------------------------------------------
+
+    def update_detections(self, detections):
+        if not detections:
+            self.detection_label.setText("No supported fruits detected.")
+            return
+
+        self.detection_label.setText(
+            "\n".join(
+                f"{index}. {item['class_name']} "
+                f"confidence={item['confidence']:.2f} "
+                f"bbox={item['bbox']}"
+                for index, item in enumerate(detections, start=1)
+            )
+        )
+
+    def update_status(self, message):
+        self.status_label.setText(message)
+
+    def stop_camera(self):
+        if self.worker.isRunning():
+            self.worker.stop()
+
+        self.stop_button.setEnabled(False)
+        self.status_label.setText("Camera stopped; robot remains disabled.")
+
+    def closeEvent(self, event):
+        LOGGER.info("Application close requested")
+
+        if self.worker.isRunning():
+            self.worker.stop()
+
+        event.accept()
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+def main():
+    app = QApplication(sys.argv)
+
+    window = JetArmFruitApp()
+    window.show()
+
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
